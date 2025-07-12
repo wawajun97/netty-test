@@ -12,6 +12,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
+
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -50,13 +53,35 @@ public class NettyInboundHandler extends ChannelInboundHandlerAdapter {
         byteBuf.writeBytes(receivedBuf);
         receivedBuf.release();
 
-        byte code = byteBuf.readByte();
-        byte[] dataArr = new byte[byteBuf.readableBytes()];
-        byteBuf.readBytes(dataArr);
+        int fileNameSize = byteBuf.readInt();
 
-        log.info("code : {}, data : {}", code, dataArr);
+        byte[] fName = new byte[fileNameSize];
+        byteBuf.readBytes(fName);
 
-        parseService.parseData(code, dataArr);
+        String fileName = new String(fName);
+
+        byte[] fileData = new byte[byteBuf.readableBytes()];
+        byteBuf.readBytes(fileData);
+
+        log.info("fileName : {}", fileName);
+
+        BufferedOutputStream bs = null;
+        try {
+            bs = new BufferedOutputStream(new FileOutputStream("./src/main/resources/files/" + fileName));
+            bs.write(fileData);
+        } catch (Exception e) {
+            e.getStackTrace();
+        }finally {
+            bs.close();
+        }
+
+//        byte code = byteBuf.readByte();
+//        byte[] dataArr = new byte[byteBuf.readableBytes()];
+//        byteBuf.readBytes(dataArr);
+//
+//        log.info("code : {}, data : {}", code, dataArr);
+//
+//        parseService.parseData(code, dataArr);
 
     }
 
