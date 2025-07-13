@@ -1,26 +1,32 @@
 package com.example.netty_test.handler;
 
-import com.example.netty_test.service.ParseService;
+import com.example.netty_test.service.FileService;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
+import io.netty.util.CharsetUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
 @ChannelHandler.Sharable
 public class NettyInboundHandler extends ChannelInboundHandlerAdapter {
-    private final ParseService parseService;
+    private final FileService fileService;
+
+
     private final AttributeKey<ByteBuf> BYTEBUF_ATTRIBUTE = AttributeKey.newInstance("ByteBufAttribute");
     @Override
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
@@ -41,7 +47,7 @@ public class NettyInboundHandler extends ChannelInboundHandlerAdapter {
     }
 
     @Override
-    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws IOException {
         Attribute<ByteBuf> attr = ctx.channel().attr(BYTEBUF_ATTRIBUTE);
         ByteBuf byteBuf = attr.get();
         ByteBuf receivedBuf = (ByteBuf) msg;
@@ -65,15 +71,9 @@ public class NettyInboundHandler extends ChannelInboundHandlerAdapter {
 
         log.info("fileName : {}", fileName);
 
-        BufferedOutputStream bs = null;
-        try {
-            bs = new BufferedOutputStream(new FileOutputStream("./src/main/resources/files/" + fileName));
-            bs.write(fileData);
-        } catch (Exception e) {
-            e.getStackTrace();
-        }finally {
-            bs.close();
-        }
+        boolean isSuccess = fileService.insertFile(fileName, fileData);
+
+        ctx.channel().writeAndFlush(Unpooled.copiedBuffer(String.valueOf(isSuccess), CharsetUtil.UTF_8));
 
 //        byte code = byteBuf.readByte();
 //        byte[] dataArr = new byte[byteBuf.readableBytes()];
