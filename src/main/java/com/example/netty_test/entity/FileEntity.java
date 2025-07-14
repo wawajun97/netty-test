@@ -6,6 +6,9 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
 
 
 @Data
@@ -25,7 +28,7 @@ public class FileEntity {
     @Column(name = "file_path")
     private String filePath;
 
-    @Column(name = "file_download_url")
-    private String fileDownloadUrl;
-
+    @Column(name = "created_at")
+    @CreationTimestamp //등록일시 자동 입력
+    private LocalDateTime createdAt;
 }

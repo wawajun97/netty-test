@@ -10,7 +10,8 @@ import org.springframework.stereotype.Service;
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.UUID;
 
 @Service
@@ -25,14 +26,19 @@ public class FileService {
     public boolean insertFile(String fileName, byte[] fileData) throws IOException {
         FileEntity fileEntity = FileEntity.builder()
                 .fileName(fileName)
-                .fileDownloadUrl("")
                 .build();
 
+        //파일 저장 실패 시 return false
         if(!moveFile(fileEntity, fileData)) return false;
 
+        //파일 저장 성공 시에만 db에 값 저장
         fileRepository.save(fileEntity);
 
         return true;
+    }
+
+    public void downloadFile() {
+
     }
 
     private boolean moveFile(FileEntity fileEntity, byte[] fileData) throws IOException {
@@ -46,6 +52,14 @@ public class FileService {
 
             fileEntity.setFilePath(filePath);
 
+            // 디렉토리 경로 객체 생성
+            Path directory = Path.of(FILE_BASE_PATH);
+
+            // 디렉토리 존재 확인 후 없으면 생성
+            if (!Files.exists(directory)) {
+                Files.createDirectories(directory);
+            }
+
             bs = new BufferedOutputStream(new FileOutputStream(filePath));
             bs.write(fileData);
         } catch (Exception e) {
@@ -53,7 +67,7 @@ public class FileService {
             e.getStackTrace();
             return false;
         }finally {
-            bs.close();
+            if(null != bs) bs.close();
         }
         return true;
     }
