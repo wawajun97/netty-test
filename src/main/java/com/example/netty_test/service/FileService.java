@@ -5,13 +5,20 @@ import com.example.netty_test.repository.FileRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedOutputStream;
+import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -37,8 +44,20 @@ public class FileService {
         return true;
     }
 
-    public void downloadFile() {
+    public ResponseEntity<?> downloadFile(Long id) {
+        Optional<FileEntity> fileEntity = fileRepository.findById(id);
 
+        if(fileEntity.isEmpty()) {
+            return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
+        }
+
+        File file = new File(fileEntity.get().getFilePath());
+
+        Resource resource = new FileSystemResource(file);
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename\"" + fileEntity.get().getFileName() + "\"")
+                .body(resource);
     }
 
     private boolean moveFile(FileEntity fileEntity, byte[] fileData) throws IOException {
