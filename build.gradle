@@ -26,18 +26,27 @@ repositories {
 
 dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-web'
-	implementation 'org.springframework:spring-web:6.2.8'
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+	implementation 'org.springframework.boot:spring-boot-starter-jdbc'
 	compileOnly 'org.projectlombok:lombok'
 	annotationProcessor 'org.projectlombok:lombok'
 	providedRuntime 'org.springframework.boot:spring-boot-starter-tomcat'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testImplementation 'com.h2database:h2'
 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
-	implementation 'mysql:mysql-connector-java:8.0.33'
+	runtimeOnly 'com.mysql:mysql-connector-j'
 
 	implementation 'io.netty:netty-all:4.2.2.Final'
 }
 
 tasks.named('test') {
 	useJUnitPlatform()
+}
+
+tasks.register('robotLoadTest', JavaExec) {
+	group = 'verification'
+	description = 'Runs the robot TCP load generator'
+	classpath = sourceSets.main.runtimeClasspath
+	mainClass = 'com.example.netty_test.load.RobotLoadTestRunner'
+	systemProperties System.properties.findAll { key, _ -> key.toString().startsWith('robot.load.') }
 }

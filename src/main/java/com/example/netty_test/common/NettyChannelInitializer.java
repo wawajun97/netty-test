@@ -1,31 +1,41 @@
 package com.example.netty_test.common;
 
-import com.example.netty_test.handler.NettyInboundHandler;
+import com.example.netty_test.config.NettyProperties;
+import com.example.netty_test.config.RobotProtocolProperties;
+import com.example.netty_test.handler.RobotAckEncoder;
+import com.example.netty_test.handler.RobotChannelStateHandler;
+import com.example.netty_test.handler.RobotFrameDecoder;
+import com.example.netty_test.handler.RobotMessageRouterHandler;
+import com.example.netty_test.metrics.RobotMetrics;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.socket.SocketChannel;
-import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
-import io.netty.util.concurrent.DefaultEventExecutorGroup;
-import io.netty.util.concurrent.EventExecutorGroup;
+import io.netty.handler.timeout.IdleStateHandler;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
-
 
 @Component
 @RequiredArgsConstructor
 public class NettyChannelInitializer extends ChannelInitializer<SocketChannel> {
-    private final NettyInboundHandler nettyInboundHandler;
-    
-    // 블로킹 작업을 처리하기 위한 별도의 스레드 그룹 생성 (스레드 수 10개 예시)
-    private final EventExecutorGroup group = new DefaultEventExecutorGroup(10);
+    private final RobotProtocolProperties robotProtocolProperties;
+    private final NettyProperties nettyProperties;
+    private final RobotMetrics robotMetrics;
+    private final RobotAckEncoder robotAckEncoder;
+    private final RobotMessageRouterHandler robotMessageRouterHandler;
+    private final RobotChannelStateHandler robotChannelStateHandler;
 
-    //새로운 연결이 들어올 때마다 pipeline에 handler 등록
     @Override
-    protected void initChannel(SocketChannel ch) throws Exception {
+    protected void initChannel(SocketChannel ch) {
         ChannelPipeline pipeline = ch.pipeline();
-        pipeline.addLast(new LengthFieldBasedFrameDecoder(1024*1024*1024,0,4,0,4));
-        
-        // nettyInboundHandler를 별도의 EventExecutorGroup에서 실행하도록 등록
-        pipeline.addLast(group, nettyInboundHandler);
+        // 연결 유휴 상태를 감시해서 죽은 세션이 계속 남지 않게 한다.
+        pipeline.addLast(new IdleStateHandler(nettyProperties.getIdleSeconds(), 0, 0));
+        // 연결 등록/해제, writability, idle close 같은 채널 상태 관리를 담당한다.
+        pipeline.addLast(robotChannelStateHandler);
+        // STX/ETX 기반 커스텀 바이너리 프로토콜을 RobotFrame으로 변환한다.
+        pipeline.addLast(new RobotFrameDecoder(robotProtocolProperties, robotMetrics));
+        // 비즈니스 처리 결과인 RobotAck를 TCP 응답 바이트로 인코딩한다.
+        pipeline.addLast(robotAckEncoder);
+        // robotType/opCode 조합으로 실제 비즈니스 핸들러를 찾아 실행한다.
+        pipeline.addLast(robotMessageRouterHandler);
     }
 }
