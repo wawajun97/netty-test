@@ -239,7 +239,12 @@ bash ./gradlew robotLoadTest
 - `robot.load.scenario`
 - `robot.load.messagesPerConnection`
 - `robot.load.durationSeconds`
+- `robot.load.maxDurationSeconds`
 - `robot.load.targetRate`
+- `robot.load.initialRate`
+- `robot.load.maxTargetRate`
+- `robot.load.rateStep`
+- `robot.load.stepDurationSeconds`
 - `robot.load.warmupSeconds`
 - `robot.load.pauseMillis`
 - `robot.load.statusRatio`
@@ -247,8 +252,11 @@ bash ./gradlew robotLoadTest
 - `robot.load.payloadProfile`
 - `robot.load.reportDir`
 - `robot.load.runnerId`
-- `robot.load.saturationStepRate`
-- `robot.load.saturationStepDurationSeconds`
+- `robot.load.stop.busyRatio`
+- `robot.load.stop.timeoutRatio`
+- `robot.load.stop.errorRatio`
+- `robot.load.stop.p99Millis`
+- `robot.load.stop.consecutiveBreaches`
 
 ### burst 예시
 
@@ -285,10 +293,16 @@ bash ./gradlew \
   -Drobot.load.host=127.0.0.1 \
   -Drobot.load.port=29001 \
   -Drobot.load.connections=500 \
-  -Drobot.load.durationSeconds=180 \
-  -Drobot.load.targetRate=50000 \
-  -Drobot.load.saturationStepRate=5000 \
-  -Drobot.load.saturationStepDurationSeconds=15 \
+  -Drobot.load.maxDurationSeconds=180 \
+  -Drobot.load.initialRate=5000 \
+  -Drobot.load.maxTargetRate=50000 \
+  -Drobot.load.rateStep=5000 \
+  -Drobot.load.stepDurationSeconds=15 \
+  -Drobot.load.stop.busyRatio=0.05 \
+  -Drobot.load.stop.timeoutRatio=0.01 \
+  -Drobot.load.stop.errorRatio=0.01 \
+  -Drobot.load.stop.p99Millis=100 \
+  -Drobot.load.stop.consecutiveBreaches=2 \
   -Drobot.load.reportDir=build/reports/robot-load \
   robotLoadTest
 ```
@@ -301,6 +315,21 @@ bash ./gradlew \
 - `latency.csv`
 - `ack-counts.csv`
 - `client-errors.csv`
+- `ramp-steps.csv`
+- `failure-threshold.json`
+
+### saturation 시나리오 동작 방식
+
+`SATURATION` 모드는 시작 TPS에서 출발한 뒤 일정 시간마다 TPS를 단계적으로 올립니다.  
+각 step마다 `busyRatio`, `timeoutRatio`, `errorRatio`, `p99 latency`를 집계하고, 지정한 임계치를 연속으로 초과하면 자동으로 테스트를 중단합니다.
+
+기본 중단 기준:
+
+- `busyRatio >= 0.05`
+- `timeoutRatio >= 0.01`
+- `errorRatio >= 0.01`
+- `p99Millis >= 100`
+- `consecutiveBreaches = 2`
 
 ## 9. Prometheus + Grafana 시각화
 

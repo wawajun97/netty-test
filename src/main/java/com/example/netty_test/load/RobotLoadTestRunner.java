@@ -1,5 +1,6 @@
 package com.example.netty_test.load;
 
+import com.example.netty_test.protocol.RobotAckResultCode;
 import com.example.netty_test.protocol.RobotConstants;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -14,6 +15,7 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -22,6 +24,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,6 +37,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Collectors;
@@ -59,12 +64,7 @@ public final class RobotLoadTestRunner {
                 ? measurementStartNanos + TimeUnit.SECONDS.toNanos(config.durationSeconds())
                 : Long.MAX_VALUE;
 
-        LoadTestMetrics metrics = new LoadTestMetrics(
-                config.runnerId(),
-                measurementStartNanos,
-                measurementEndNanos
-        );
-
+        LoadTestMetrics metrics = new LoadTestMetrics(config, measurementStartNanos, measurementEndNanos);
         ExecutorService executorService = Executors.newFixedThreadPool(config.connections());
         CountDownLatch latch = new CountDownLatch(config.connections());
         Instant startedAt = Instant.now();
@@ -84,8 +84,11 @@ public final class RobotLoadTestRunner {
         executorService.shutdown();
         executorService.awaitTermination(1, TimeUnit.MINUTES);
 
+        long finishedAtNanos = System.nanoTime();
+        metrics.complete(finishedAtNanos);
+
         Instant finishedAt = Instant.now();
-        LoadTestSummary summary = metrics.toSummary(config, startedAt, finishedAt);
+        LoadTestSummary summary = metrics.toSummary(config, startedAt, finishedAt, finishedAtNanos);
         writeReports(summary, metrics, config);
         return summary;
     }
@@ -110,35 +113,38 @@ public final class RobotLoadTestRunner {
 
                 while (shouldContinue(config, metrics, messageIndex)) {
                     long plannedSendNanos = nextSendNanos;
-                    long beforeSendNanos = System.nanoTime();
-
                     if (config.scenario() != LoadScenario.BURST) {
                         waitUntil(plannedSendNanos);
-                        beforeSendNanos = System.nanoTime();
+                    }
+
+                    long beforeSendNanos = System.nanoTime();
+                    if (!shouldContinue(config, metrics, messageIndex)) {
+                        break;
                     }
 
                     boolean sampled = metrics.shouldSample(beforeSendNanos);
+                    long targetRate = currentTargetRate(config, metrics.measurementStartNanos(), beforeSendNanos);
                     RobotMessage message = buildMessage(config, clientId, messageIndex);
 
                     if (sampled) {
-                        metrics.recordSent();
+                        metrics.recordSent(beforeSendNanos, targetRate);
                     }
 
                     try {
                         writeFrame(outputStream, message.robotType(), message.opCode(), message.payload());
                         LoadAck ack = readAck(inputStream);
                         if (sampled) {
-                            metrics.recordAck(ack.resultCode(), System.nanoTime() - beforeSendNanos);
+                            metrics.recordAck(ack.resultCode(), beforeSendNanos, System.nanoTime(), targetRate);
                         }
                     } catch (Exception e) {
                         if (sampled) {
-                            metrics.recordClientError(e.getClass().getSimpleName());
+                            metrics.recordClientError(e.getClass().getSimpleName(), beforeSendNanos, System.nanoTime(), targetRate);
                         }
                         break;
                     }
 
                     messageIndex++;
-                    nextSendNanos = calculateNextSendNanos(config, messageIndex, beforeSendNanos, plannedSendNanos, metrics);
+                    nextSendNanos = calculateNextSendNanos(config, beforeSendNanos, plannedSendNanos, metrics);
 
                     if (config.pauseMillis() > 0) {
                         sleepMillis(config.pauseMillis());
@@ -146,13 +152,19 @@ public final class RobotLoadTestRunner {
                 }
             }
         } catch (Exception e) {
-            if (metrics.isMeasurementWindowOpen()) {
-                metrics.recordClientError(e.getClass().getSimpleName());
+            long now = System.nanoTime();
+            if (metrics.shouldSample(now)) {
+                long targetRate = currentTargetRate(config, metrics.measurementStartNanos(), now);
+                metrics.recordClientError(e.getClass().getSimpleName(), now, now, targetRate);
             }
         }
     }
 
     private static boolean shouldContinue(LoadTestConfig config, LoadTestMetrics metrics, int messageIndex) {
+        if (metrics.shouldStop()) {
+            return false;
+        }
+
         long now = System.nanoTime();
         boolean withinDuration = config.durationSeconds() <= 0 || now < metrics.measurementEndNanos();
         boolean withinMessageLimit = config.messagesPerConnection() <= 0 || messageIndex < config.messagesPerConnection();
@@ -170,7 +182,6 @@ public final class RobotLoadTestRunner {
 
     private static long calculateNextSendNanos(
             LoadTestConfig config,
-            int messageIndex,
             long actualSendNanos,
             long plannedSendNanos,
             LoadTestMetrics metrics
@@ -179,28 +190,25 @@ public final class RobotLoadTestRunner {
             return actualSendNanos;
         }
 
-        long intervalNanos = switch (config.scenario()) {
-            case SUSTAINED, SOAK -> nanosPerMessage(config.targetRate(), config.connections());
-            case SATURATION -> nanosPerMessage(
-                    currentSaturationRate(config, metrics.measurementStartNanos(), actualSendNanos),
-                    config.connections()
-            );
-            default -> 0L;
-        };
-
+        long targetRate = currentTargetRate(config, metrics.measurementStartNanos(), actualSendNanos);
+        long intervalNanos = nanosPerMessage(targetRate, config.connections());
         return Math.max(actualSendNanos, plannedSendNanos) + intervalNanos;
     }
 
-    private static long currentSaturationRate(LoadTestConfig config, long measurementStartNanos, long nowNanos) {
-        if (config.targetRate() <= 0) {
-            return 1L;
-        }
+    private static long currentTargetRate(LoadTestConfig config, long measurementStartNanos, long nowNanos) {
+        return switch (config.scenario()) {
+            case BURST -> 0L;
+            case SUSTAINED, SOAK -> Math.max(1L, config.targetRate());
+            case SATURATION -> currentSaturationRate(config, measurementStartNanos, nowNanos);
+        };
+    }
 
+    private static long currentSaturationRate(LoadTestConfig config, long measurementStartNanos, long nowNanos) {
         long elapsedNanos = Math.max(0L, nowNanos - measurementStartNanos);
         long elapsedSeconds = TimeUnit.NANOSECONDS.toSeconds(elapsedNanos);
-        long currentStep = elapsedSeconds / Math.max(1, config.saturationStepDurationSeconds());
-        long rate = (currentStep + 1) * Math.max(1, config.saturationStepRate());
-        return Math.min(rate, config.targetRate());
+        long currentStep = elapsedSeconds / Math.max(1, config.stepDurationSeconds());
+        long rate = config.initialRate() + (currentStep * Math.max(1, config.rateStep()));
+        return Math.max(1L, Math.min(rate, Math.max(config.initialRate(), config.maxTargetRate())));
     }
 
     private static long nanosPerMessage(long targetRate, int connections) {
@@ -324,6 +332,7 @@ public final class RobotLoadTestRunner {
         Files.createDirectories(outputDirectory);
 
         OBJECT_MAPPER.writeValue(outputDirectory.resolve("summary.json").toFile(), summary.asJson());
+        OBJECT_MAPPER.writeValue(outputDirectory.resolve("failure-threshold.json").toFile(), summary.failureThreshold().asJson());
 
         try (BufferedWriter writer = Files.newBufferedWriter(outputDirectory.resolve("latency.csv"))) {
             writer.write("bucketSecond,count,p50Millis,p95Millis,p99Millis,maxMillis");
@@ -356,6 +365,30 @@ public final class RobotLoadTestRunner {
                 writer.newLine();
             }
         }
+
+        try (BufferedWriter writer = Files.newBufferedWriter(outputDirectory.resolve("ramp-steps.csv"))) {
+            writer.write("stepIndex,targetRate,sent,ackCount,busyCount,timeoutCount,errorCount,actualThroughputPerSecond,busyRatio,timeoutRatio,errorRatio,p50Millis,p95Millis,p99Millis,maxMillis,breachedMetrics");
+            writer.newLine();
+            for (RampStepSummary step : metrics.rampSteps()) {
+                writer.write(step.stepIndex() + "," +
+                        step.targetRate() + "," +
+                        step.sent() + "," +
+                        step.ackCount() + "," +
+                        step.busyCount() + "," +
+                        step.timeoutCount() + "," +
+                        step.errorCount() + "," +
+                        String.format(Locale.US, "%.3f", step.actualThroughputPerSecond()) + "," +
+                        String.format(Locale.US, "%.4f", step.busyRatio()) + "," +
+                        String.format(Locale.US, "%.4f", step.timeoutRatio()) + "," +
+                        String.format(Locale.US, "%.4f", step.errorRatio()) + "," +
+                        String.format(Locale.US, "%.3f", step.p50Millis()) + "," +
+                        String.format(Locale.US, "%.3f", step.p95Millis()) + "," +
+                        String.format(Locale.US, "%.3f", step.p99Millis()) + "," +
+                        String.format(Locale.US, "%.3f", step.maxMillis()) + "," +
+                        escapeCsv(String.join(" | ", step.breachedMetrics())));
+                writer.newLine();
+            }
+        }
     }
 
     private static void printSummary(LoadTestSummary summary) {
@@ -374,6 +407,12 @@ public final class RobotLoadTestRunner {
         System.out.println("ackCounts=" + summary.ackCounts());
         if (!summary.clientErrors().isEmpty()) {
             System.out.println("clientErrors=" + summary.clientErrors());
+        }
+        if (summary.failureThreshold().triggered()) {
+            System.out.println("stopReason=" + summary.failureThreshold().reason());
+            System.out.println("breachedStep=" + summary.failureThreshold().breachedStepIndex());
+            System.out.println("breachedTargetRate=" + summary.failureThreshold().breachedTargetRate());
+            System.out.println("breachedMetrics=" + summary.failureThreshold().breachedMetrics());
         }
         System.out.println("reportDir=" + summary.reportDirectory());
     }
@@ -410,6 +449,14 @@ public final class RobotLoadTestRunner {
 
     private static String formatMillis(long nanos) {
         return String.format(Locale.US, "%.3f", nanos / 1_000_000.0);
+    }
+
+    private static String escapeCsv(String value) {
+        if (value == null || value.isEmpty()) {
+            return "";
+        }
+        String escaped = value.replace("\"", "\"\"");
+        return '"' + escaped + '"';
     }
 
     record LoadAck(int robotType, int resultCode, int requestOpCode, String message) {
@@ -470,6 +517,34 @@ public final class RobotLoadTestRunner {
         }
     }
 
+    record StopCondition(
+            double busyRatioThreshold,
+            double timeoutRatioThreshold,
+            double errorRatioThreshold,
+            double p99MillisThreshold,
+            int consecutiveBreaches
+    ) {
+        static StopCondition fromSystemProperties() {
+            return new StopCondition(
+                    Double.parseDouble(System.getProperty("robot.load.stop.busyRatio", "0.05")),
+                    Double.parseDouble(System.getProperty("robot.load.stop.timeoutRatio", "0.01")),
+                    Double.parseDouble(System.getProperty("robot.load.stop.errorRatio", "0.01")),
+                    Double.parseDouble(System.getProperty("robot.load.stop.p99Millis", "100")),
+                    Integer.getInteger("robot.load.stop.consecutiveBreaches", 2)
+            );
+        }
+
+        Map<String, Object> asJson() {
+            Map<String, Object> json = new LinkedHashMap<>();
+            json.put("busyRatioThreshold", busyRatioThreshold);
+            json.put("timeoutRatioThreshold", timeoutRatioThreshold);
+            json.put("errorRatioThreshold", errorRatioThreshold);
+            json.put("p99MillisThreshold", p99MillisThreshold);
+            json.put("consecutiveBreaches", consecutiveBreaches);
+            return json;
+        }
+    }
+
     record LoadTestConfig(
             String host,
             int port,
@@ -485,17 +560,39 @@ public final class RobotLoadTestRunner {
             PayloadProfile payloadProfile,
             int connectTimeoutMillis,
             int readTimeoutMillis,
-            int saturationStepRate,
-            int saturationStepDurationSeconds,
+            int initialRate,
+            int maxTargetRate,
+            int rateStep,
+            int stepDurationSeconds,
+            StopCondition stopCondition,
             String runnerId,
             long startBarrierEpochMillis,
             Path outputDirectory
     ) {
         static LoadTestConfig fromSystemProperties() {
             LoadScenario scenario = LoadScenario.fromProperty(System.getProperty("robot.load.scenario", "burst"));
-            int durationSeconds = Integer.getInteger("robot.load.durationSeconds", scenario == LoadScenario.BURST ? 0 : 60);
+            int durationSeconds = Integer.getInteger(
+                    "robot.load.maxDurationSeconds",
+                    Integer.getInteger("robot.load.durationSeconds", scenario == LoadScenario.BURST ? 0 : 60)
+            );
             int targetRate = Integer.getInteger("robot.load.targetRate", scenario == LoadScenario.BURST ? 0 : 10_000);
             int messagesPerConnection = Integer.getInteger("robot.load.messagesPerConnection", scenario == LoadScenario.BURST ? 100 : 0);
+            int rateStep = Integer.getInteger(
+                    "robot.load.rateStep",
+                    Integer.getInteger("robot.load.saturationStepRate", 5_000)
+            );
+            int stepDurationSeconds = Integer.getInteger(
+                    "robot.load.stepDurationSeconds",
+                    Integer.getInteger("robot.load.saturationStepDurationSeconds", 15)
+            );
+            int initialRate = Integer.getInteger(
+                    "robot.load.initialRate",
+                    scenario == LoadScenario.SATURATION ? Math.max(1, rateStep) : Math.max(1, targetRate)
+            );
+            int maxTargetRate = Integer.getInteger(
+                    "robot.load.maxTargetRate",
+                    scenario == LoadScenario.SATURATION ? Math.max(targetRate, initialRate) : Math.max(1, targetRate)
+            );
             String runnerId = System.getProperty("robot.load.runnerId", defaultRunnerId());
             String baseReportDir = System.getProperty("robot.load.reportDir", "build/reports/robot-load");
             String timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(java.time.LocalDateTime.now());
@@ -515,8 +612,11 @@ public final class RobotLoadTestRunner {
                     PayloadProfile.fromProperty(System.getProperty("robot.load.payloadProfile", "small")),
                     Integer.getInteger("robot.load.connectTimeoutMillis", 3000),
                     Integer.getInteger("robot.load.readTimeoutMillis", 3000),
-                    Integer.getInteger("robot.load.saturationStepRate", 5_000),
-                    Integer.getInteger("robot.load.saturationStepDurationSeconds", 15),
+                    initialRate,
+                    Math.max(initialRate, maxTargetRate),
+                    Math.max(1, rateStep),
+                    Math.max(1, stepDurationSeconds),
+                    StopCondition.fromSystemProperties(),
                     runnerId,
                     Long.getLong("robot.load.startBarrierEpochMillis", 0L),
                     Path.of(baseReportDir, timestamp + "-" + runnerId)
@@ -534,18 +634,27 @@ public final class RobotLoadTestRunner {
     }
 
     static final class LoadTestMetrics {
-        private final String runnerId;
+        private final LoadTestConfig config;
         private final long measurementStartNanos;
         private final long measurementEndNanos;
         private final LongAdder totalSent = new LongAdder();
         private final LongAdder totalAcks = new LongAdder();
-        private final List<Long> latenciesNanos = java.util.Collections.synchronizedList(new ArrayList<>());
+        private final List<Long> latenciesNanos = Collections.synchronizedList(new ArrayList<>());
         private final ConcurrentHashMap<Long, List<Long>> latencyBuckets = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Integer, LongAdder> ackCounts = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<String, LongAdder> clientErrors = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Integer, StepMetrics> stepMetrics = new ConcurrentHashMap<>();
+        private final List<RampStepSummary> rampSteps = new ArrayList<>();
+        private final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        private final AtomicLong stopRequestedNanos = new AtomicLong(Long.MAX_VALUE);
 
-        private LoadTestMetrics(String runnerId, long measurementStartNanos, long measurementEndNanos) {
-            this.runnerId = runnerId;
+        private volatile FailureThreshold failureThreshold = FailureThreshold.notTriggered();
+        private volatile RampStepSummary lastHealthyStep;
+        private int lastEvaluatedStepIndex = -1;
+        private int consecutiveBreaches;
+
+        private LoadTestMetrics(LoadTestConfig config, long measurementStartNanos, long measurementEndNanos) {
+            this.config = config;
             this.measurementStartNanos = measurementStartNanos;
             this.measurementEndNanos = measurementEndNanos;
         }
@@ -554,27 +663,65 @@ public final class RobotLoadTestRunner {
             return sendStartedNanos >= measurementStartNanos && sendStartedNanos < measurementEndNanos;
         }
 
-        boolean isMeasurementWindowOpen() {
-            long now = System.nanoTime();
-            return now >= measurementStartNanos && now < measurementEndNanos;
+        boolean shouldStop() {
+            return stopRequested.get();
         }
 
-        void recordSent() {
+        void recordSent(long sendStartedNanos, long targetRate) {
             totalSent.increment();
+            if (config.scenario() != LoadScenario.SATURATION) {
+                return;
+            }
+
+            stepMetricsFor(sendStartedNanos, targetRate).sent.increment();
+            maybeEvaluateClosedSteps(sendStartedNanos, false);
         }
 
-        void recordAck(int resultCode, long latencyNanos) {
+        void recordAck(int resultCode, long sendStartedNanos, long completedNanos, long targetRate) {
             totalAcks.increment();
-            latenciesNanos.add(latencyNanos);
+            latenciesNanos.add(completedNanos - sendStartedNanos);
             ackCounts.computeIfAbsent(resultCode, ignored -> new LongAdder()).increment();
 
-            long bucketSecond = TimeUnit.NANOSECONDS.toSeconds(Math.max(0L, System.nanoTime() - measurementStartNanos));
-            latencyBuckets.computeIfAbsent(bucketSecond, ignored -> java.util.Collections.synchronizedList(new ArrayList<>()))
-                    .add(latencyNanos);
+            long bucketSecond = TimeUnit.NANOSECONDS.toSeconds(Math.max(0L, completedNanos - measurementStartNanos));
+            latencyBuckets.computeIfAbsent(bucketSecond, ignored -> Collections.synchronizedList(new ArrayList<>()))
+                    .add(completedNanos - sendStartedNanos);
+
+            if (config.scenario() != LoadScenario.SATURATION) {
+                return;
+            }
+
+            StepMetrics step = stepMetricsFor(sendStartedNanos, targetRate);
+            step.ackCount.increment();
+            step.latenciesNanos.add(completedNanos - sendStartedNanos);
+            if (resultCode == Byte.toUnsignedInt(RobotAckResultCode.BUSY.getCode())) {
+                step.busyCount.increment();
+            } else if (resultCode != Byte.toUnsignedInt(RobotAckResultCode.SUCCESS.getCode())) {
+                step.errorCount.increment();
+            }
+            maybeEvaluateClosedSteps(completedNanos, false);
         }
 
-        void recordClientError(String errorType) {
+        void recordClientError(String errorType, long sendStartedNanos, long completedNanos, long targetRate) {
             clientErrors.computeIfAbsent(errorType, ignored -> new LongAdder()).increment();
+            if (config.scenario() != LoadScenario.SATURATION) {
+                return;
+            }
+
+            StepMetrics step = stepMetricsFor(sendStartedNanos, targetRate);
+            if (Objects.equals(errorType, SocketTimeoutException.class.getSimpleName())) {
+                step.timeoutCount.increment();
+            } else {
+                step.errorCount.increment();
+            }
+            maybeEvaluateClosedSteps(completedNanos, false);
+        }
+
+        synchronized void complete(long finishedAtNanos) {
+            maybeEvaluateClosedSteps(finishedAtNanos, true);
+        }
+
+        synchronized List<RampStepSummary> rampSteps() {
+            return new ArrayList<>(rampSteps);
         }
 
         List<LatencyBucketSummary> bucketSummaries() {
@@ -595,14 +742,19 @@ public final class RobotLoadTestRunner {
                     .toList();
         }
 
-        LoadTestSummary toSummary(LoadTestConfig config, Instant startedAt, Instant finishedAt) {
+        LoadTestSummary toSummary(LoadTestConfig config, Instant startedAt, Instant finishedAt, long finishedAtNanos) {
             List<Long> sortedLatencies = new ArrayList<>(latenciesNanos);
             sortedLatencies.sort(Comparator.naturalOrder());
 
-            Duration measurementDuration = measurementEndNanos == Long.MAX_VALUE
-                    ? Duration.between(startedAt, finishedAt)
-                    : Duration.ofNanos(Math.max(0L, measurementEndNanos - measurementStartNanos));
+            long effectiveEndNanos = Math.min(
+                    finishedAtNanos,
+                    Math.min(measurementEndNanos, stopRequestedNanos.get())
+            );
+            if (effectiveEndNanos == Long.MAX_VALUE) {
+                effectiveEndNanos = finishedAtNanos;
+            }
 
+            Duration measurementDuration = Duration.ofNanos(Math.max(0L, effectiveEndNanos - measurementStartNanos));
             long sent = totalSent.sum();
             long ack = totalAcks.sum();
             double durationSeconds = Math.max(0.001d, measurementDuration.toMillis() / 1000.0d);
@@ -612,7 +764,7 @@ public final class RobotLoadTestRunner {
                     config.scenario().name(),
                     config.host(),
                     config.port(),
-                    runnerId,
+                    config.runnerId(),
                     config.connections(),
                     sent,
                     ack,
@@ -626,8 +778,128 @@ public final class RobotLoadTestRunner {
                     config.outputDirectory().toString(),
                     startedAt.toString(),
                     finishedAt.toString(),
+                    failureThreshold,
                     config
             );
+        }
+
+        private StepMetrics stepMetricsFor(long eventNanos, long targetRate) {
+            int stepIndex = stepIndexForEvent(eventNanos);
+            return stepMetrics.computeIfAbsent(stepIndex, ignored -> new StepMetrics(stepIndex, targetRate));
+        }
+
+        private synchronized void maybeEvaluateClosedSteps(long observedNanos, boolean force) {
+            if (config.scenario() != LoadScenario.SATURATION) {
+                return;
+            }
+
+            int latestObservedStep = stepIndexForEvent(observedNanos);
+            int eligibleStep = force ? latestObservedStep : latestObservedStep - 1;
+
+            while (lastEvaluatedStepIndex < eligibleStep) {
+                int nextStep = lastEvaluatedStepIndex + 1;
+                StepMetrics step = stepMetrics.get(nextStep);
+                lastEvaluatedStepIndex = nextStep;
+                if (step == null) {
+                    continue;
+                }
+
+                RampStepSummary summary = summarizeStep(step, observedNanos);
+                rampSteps.add(summary);
+
+                if (summary.breachedMetrics().isEmpty()) {
+                    consecutiveBreaches = 0;
+                    lastHealthyStep = summary;
+                    continue;
+                }
+
+                consecutiveBreaches++;
+                if (consecutiveBreaches >= config.stopCondition().consecutiveBreaches() && stopRequested.compareAndSet(false, true)) {
+                    stopRequestedNanos.set(observedNanos);
+                    failureThreshold = FailureThreshold.triggered(
+                            "threshold breached",
+                            summary.stepIndex(),
+                            summary.targetRate(),
+                            consecutiveBreaches,
+                            summary.breachedMetrics(),
+                            lastHealthyStep,
+                            summary
+                    );
+                }
+            }
+        }
+
+        private RampStepSummary summarizeStep(StepMetrics step, long observedNanos) {
+            List<Long> sortedLatencies = new ArrayList<>(step.latenciesNanos);
+            sortedLatencies.sort(Comparator.naturalOrder());
+
+            long stepStartNanos = measurementStartNanos + (long) step.stepIndex * TimeUnit.SECONDS.toNanos(config.stepDurationSeconds());
+            long stepEndNanos = Math.min(
+                    stepStartNanos + TimeUnit.SECONDS.toNanos(config.stepDurationSeconds()),
+                    Math.max(observedNanos, stepStartNanos + 1)
+            );
+
+            double stepDurationSeconds = Math.max(0.001d, (stepEndNanos - stepStartNanos) / 1_000_000_000.0d);
+            long sent = step.sent.sum();
+            long ackCount = step.ackCount.sum();
+            long busyCount = step.busyCount.sum();
+            long timeoutCount = step.timeoutCount.sum();
+            long errorCount = step.errorCount.sum();
+            double actualThroughput = ackCount / stepDurationSeconds;
+            double busyRatio = sent == 0 ? 0d : busyCount / (double) sent;
+            double timeoutRatio = sent == 0 ? 0d : timeoutCount / (double) sent;
+            double errorRatio = sent == 0 ? 0d : errorCount / (double) sent;
+            double p50Millis = nanosToMillis(percentile(sortedLatencies, 0.50));
+            double p95Millis = nanosToMillis(percentile(sortedLatencies, 0.95));
+            double p99Millis = nanosToMillis(percentile(sortedLatencies, 0.99));
+            double maxMillis = nanosToMillis(sortedLatencies.isEmpty() ? 0L : sortedLatencies.get(sortedLatencies.size() - 1));
+            List<String> breachedMetrics = evaluateBreaches(busyRatio, timeoutRatio, errorRatio, p99Millis);
+
+            return new RampStepSummary(
+                    step.stepIndex,
+                    step.targetRate,
+                    sent,
+                    ackCount,
+                    busyCount,
+                    timeoutCount,
+                    errorCount,
+                    actualThroughput,
+                    busyRatio,
+                    timeoutRatio,
+                    errorRatio,
+                    p50Millis,
+                    p95Millis,
+                    p99Millis,
+                    maxMillis,
+                    breachedMetrics
+            );
+        }
+
+        private List<String> evaluateBreaches(double busyRatio, double timeoutRatio, double errorRatio, double p99Millis) {
+            List<String> breached = new ArrayList<>();
+            if (busyRatio >= config.stopCondition().busyRatioThreshold()) {
+                breached.add("busyRatio=" + formatRatio(busyRatio) + " threshold=" + formatRatio(config.stopCondition().busyRatioThreshold()));
+            }
+            if (timeoutRatio >= config.stopCondition().timeoutRatioThreshold()) {
+                breached.add("timeoutRatio=" + formatRatio(timeoutRatio) + " threshold=" + formatRatio(config.stopCondition().timeoutRatioThreshold()));
+            }
+            if (errorRatio >= config.stopCondition().errorRatioThreshold()) {
+                breached.add("errorRatio=" + formatRatio(errorRatio) + " threshold=" + formatRatio(config.stopCondition().errorRatioThreshold()));
+            }
+            if (p99Millis >= config.stopCondition().p99MillisThreshold()) {
+                breached.add("p99Millis=" + String.format(Locale.US, "%.3f", p99Millis) +
+                        " threshold=" + String.format(Locale.US, "%.3f", config.stopCondition().p99MillisThreshold()));
+            }
+            return breached;
+        }
+
+        private String formatRatio(double value) {
+            return String.format(Locale.US, "%.4f", value);
+        }
+
+        private int stepIndexForEvent(long eventNanos) {
+            long elapsedNanos = Math.max(0L, eventNanos - measurementStartNanos);
+            return (int) (TimeUnit.NANOSECONDS.toSeconds(elapsedNanos) / Math.max(1, config.stepDurationSeconds()));
         }
 
         private Map<Integer, Long> toAckCountMap(ConcurrentHashMap<Integer, LongAdder> source) {
@@ -661,6 +933,22 @@ public final class RobotLoadTestRunner {
         }
     }
 
+    private static final class StepMetrics {
+        private final int stepIndex;
+        private final long targetRate;
+        private final LongAdder sent = new LongAdder();
+        private final LongAdder ackCount = new LongAdder();
+        private final LongAdder busyCount = new LongAdder();
+        private final LongAdder timeoutCount = new LongAdder();
+        private final LongAdder errorCount = new LongAdder();
+        private final List<Long> latenciesNanos = Collections.synchronizedList(new ArrayList<>());
+
+        private StepMetrics(int stepIndex, long targetRate) {
+            this.stepIndex = stepIndex;
+            this.targetRate = targetRate;
+        }
+    }
+
     record LatencyBucketSummary(
             long bucketSecond,
             int count,
@@ -669,6 +957,78 @@ public final class RobotLoadTestRunner {
             long p99Nanos,
             long maxNanos
     ) {
+    }
+
+    record RampStepSummary(
+            int stepIndex,
+            long targetRate,
+            long sent,
+            long ackCount,
+            long busyCount,
+            long timeoutCount,
+            long errorCount,
+            double actualThroughputPerSecond,
+            double busyRatio,
+            double timeoutRatio,
+            double errorRatio,
+            double p50Millis,
+            double p95Millis,
+            double p99Millis,
+            double maxMillis,
+            List<String> breachedMetrics
+    ) {
+    }
+
+    record FailureThreshold(
+            boolean triggered,
+            String reason,
+            Integer breachedStepIndex,
+            Long breachedTargetRate,
+            int consecutiveBreaches,
+            String triggeredAt,
+            List<String> breachedMetrics,
+            RampStepSummary lastHealthyStep,
+            RampStepSummary triggeredStep
+    ) {
+        static FailureThreshold notTriggered() {
+            return new FailureThreshold(false, "not_triggered", null, null, 0, null, List.of(), null, null);
+        }
+
+        static FailureThreshold triggered(
+                String reason,
+                int breachedStepIndex,
+                long breachedTargetRate,
+                int consecutiveBreaches,
+                List<String> breachedMetrics,
+                RampStepSummary lastHealthyStep,
+                RampStepSummary triggeredStep
+        ) {
+            return new FailureThreshold(
+                    true,
+                    reason,
+                    breachedStepIndex,
+                    breachedTargetRate,
+                    consecutiveBreaches,
+                    Instant.now().toString(),
+                    List.copyOf(breachedMetrics),
+                    lastHealthyStep,
+                    triggeredStep
+            );
+        }
+
+        Map<String, Object> asJson() {
+            Map<String, Object> json = new LinkedHashMap<>();
+            json.put("triggered", triggered);
+            json.put("reason", reason);
+            json.put("breachedStepIndex", breachedStepIndex);
+            json.put("breachedTargetRate", breachedTargetRate);
+            json.put("consecutiveBreaches", consecutiveBreaches);
+            json.put("triggeredAt", triggeredAt);
+            json.put("breachedMetrics", breachedMetrics);
+            json.put("lastHealthyStep", lastHealthyStep);
+            json.put("triggeredStep", triggeredStep);
+            return json;
+        }
     }
 
     record LoadTestSummary(
@@ -689,6 +1049,7 @@ public final class RobotLoadTestRunner {
             String reportDirectory,
             String startedAt,
             String finishedAt,
+            FailureThreshold failureThreshold,
             LoadTestConfig config
     ) {
         Map<String, Object> asJson() {
@@ -702,29 +1063,40 @@ public final class RobotLoadTestRunner {
             json.put("totalAcks", totalAcks);
             json.put("measurementDurationSeconds", measurementDurationSeconds);
             json.put("throughputPerSecond", throughputPerSecond);
-            json.put("latency", Map.of(
-                    "p50Millis", p50Millis,
-                    "p95Millis", p95Millis,
-                    "p99Millis", p99Millis
-            ));
+
+            Map<String, Object> latency = new LinkedHashMap<>();
+            latency.put("p50Millis", p50Millis);
+            latency.put("p95Millis", p95Millis);
+            latency.put("p99Millis", p99Millis);
+            json.put("latency", latency);
+
             json.put("ackCounts", ackCounts);
             json.put("clientErrors", clientErrors);
             json.put("reportDirectory", reportDirectory);
             json.put("startedAt", startedAt);
             json.put("finishedAt", finishedAt);
-            json.put("config", Map.of(
-                    "scenario", config.scenario().name(),
-                    "messagesPerConnection", config.messagesPerConnection(),
-                    "durationSeconds", config.durationSeconds(),
-                    "targetRate", config.targetRate(),
-                    "warmupSeconds", config.warmupSeconds(),
-                    "payloadProfile", config.payloadProfile().name(),
-                    "statusRatio", config.statusRatio(),
-                    "robotTypeMix", "A:" + String.format(Locale.US, "%.2f", config.robotTypeMix().typeARatio() * 100d) +
-                            ",B:" + String.format(Locale.US, "%.2f", (1d - config.robotTypeMix().typeARatio()) * 100d),
-                    "saturationStepRate", config.saturationStepRate(),
-                    "saturationStepDurationSeconds", config.saturationStepDurationSeconds()
-            ));
+            json.put("failureThreshold", failureThreshold.asJson());
+
+            Map<String, Object> configJson = new LinkedHashMap<>();
+            configJson.put("scenario", config.scenario().name());
+            configJson.put("messagesPerConnection", config.messagesPerConnection());
+            configJson.put("durationSeconds", config.durationSeconds());
+            configJson.put("targetRate", config.targetRate());
+            configJson.put("warmupSeconds", config.warmupSeconds());
+            configJson.put("payloadProfile", config.payloadProfile().name());
+            configJson.put("statusRatio", config.statusRatio());
+            configJson.put(
+                    "robotTypeMix",
+                    "A:" + String.format(Locale.US, "%.2f", config.robotTypeMix().typeARatio() * 100d) +
+                            ",B:" + String.format(Locale.US, "%.2f", (1d - config.robotTypeMix().typeARatio()) * 100d)
+            );
+            configJson.put("initialRate", config.initialRate());
+            configJson.put("maxTargetRate", config.maxTargetRate());
+            configJson.put("rateStep", config.rateStep());
+            configJson.put("stepDurationSeconds", config.stepDurationSeconds());
+            configJson.put("stopCondition", config.stopCondition().asJson());
+            json.put("config", configJson);
+
             return json;
         }
     }
