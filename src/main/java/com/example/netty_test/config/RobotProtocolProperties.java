@@ -9,4 +9,5 @@ import org.springframework.stereotype.Component;
 @ConfigurationProperties(prefix = "robot.protocol")
 public class RobotProtocolProperties {
     private int maxPayloadLength = 65_536;
+    private long partialFrameTimeoutMs = 1_000;
 }

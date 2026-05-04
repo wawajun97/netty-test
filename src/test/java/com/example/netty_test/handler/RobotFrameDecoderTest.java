@@ -13,6 +13,8 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -61,10 +63,64 @@ class RobotFrameDecoderTest {
         channel.finishAndReleaseAll();
     }
 
+    @Test
+    void discardsTimedOutPartialFrameAndDecodesNextFrame() {
+        AtomicLong nanoTime = new AtomicLong();
+        EmbeddedChannel channel = new EmbeddedChannel(newDecoder(256, 1_000, nanoTime::get));
+        ByteBuf frame = buildFrame(RobotConstants.ROBOT_TYPE_A, RobotConstants.STATUS_OP_CODE, statusPayload("robot-a"));
+        ByteBuf partialFrame = frame.copy(0, 8);
+        ByteBuf nextFrame = frame.copy();
+        frame.release();
+
+        channel.writeInbound(partialFrame);
+        nanoTime.addAndGet(TimeUnit.MILLISECONDS.toNanos(1_001));
+        channel.writeInbound(nextFrame);
+
+        RobotProtocolError error = channel.readInbound();
+        assertThat(error).isNotNull();
+        assertThat(error.getResultCode()).isEqualTo(RobotAckResultCode.INVALID_FRAME);
+        assertThat(error.getMessage()).isEqualTo("PARTIAL_FRAME_TIMEOUT");
+
+        RobotFrame decoded = channel.readInbound();
+        assertThat(decoded).isNotNull();
+        assertThat(decoded.getRobotType()).isEqualTo(RobotConstants.ROBOT_TYPE_A);
+        assertThat(decoded.getOpCode()).isEqualTo(RobotConstants.STATUS_OP_CODE);
+        decoded.release();
+        channel.finishAndReleaseAll();
+    }
+
+    @Test
+    void decodesFragmentedFrameWhenTimeoutHasNotElapsed() {
+        AtomicLong nanoTime = new AtomicLong();
+        EmbeddedChannel channel = new EmbeddedChannel(newDecoder(256, 1_000, nanoTime::get));
+        ByteBuf frame = buildFrame(RobotConstants.ROBOT_TYPE_A, RobotConstants.STATUS_OP_CODE, statusPayload("robot-a"));
+        ByteBuf partialFrame = frame.copy(0, 8);
+        ByteBuf remainingFrame = frame.copy(8, frame.readableBytes() - 8);
+        frame.release();
+
+        channel.writeInbound(partialFrame);
+        nanoTime.addAndGet(TimeUnit.MILLISECONDS.toNanos(500));
+        channel.writeInbound(remainingFrame);
+
+        RobotFrame decoded = channel.readInbound();
+        assertThat(decoded).isNotNull();
+        assertThat(decoded.getRobotType()).isEqualTo(RobotConstants.ROBOT_TYPE_A);
+        assertThat(decoded.getOpCode()).isEqualTo(RobotConstants.STATUS_OP_CODE);
+        decoded.release();
+        Object nextMessage = channel.readInbound();
+        assertThat(nextMessage).isNull();
+        channel.finishAndReleaseAll();
+    }
+
     private RobotFrameDecoder newDecoder(int maxPayloadLength) {
+        return newDecoder(maxPayloadLength, 1_000, System::nanoTime);
+    }
+
+    private RobotFrameDecoder newDecoder(int maxPayloadLength, long partialFrameTimeoutMs, java.util.function.LongSupplier nanoTimeSupplier) {
         RobotProtocolProperties properties = new RobotProtocolProperties();
         properties.setMaxPayloadLength(maxPayloadLength);
-        return new RobotFrameDecoder(properties, new RobotMetrics(new SimpleMeterRegistry()));
+        properties.setPartialFrameTimeoutMs(partialFrameTimeoutMs);
+        return new RobotFrameDecoder(properties, new RobotMetrics(new SimpleMeterRegistry()), nanoTimeSupplier);
     }
 
     private ByteBuf buildFrame(byte robotType, byte opCode, ByteBuf payload) {
