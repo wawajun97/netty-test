@@ -3,6 +3,13 @@
 Spring Boot + Netty 기반의 로봇 TCP 통신 서버입니다.  
 여러 종류의 로봇 메시지를 수신하고, `robotType` + `opCode` 기준으로 비즈니스 로직을 분기한 뒤, 응답은 즉시 ACK/NACK로 돌려주고 저장은 비동기 JDBC batch로 처리합니다.
 
+### Netty를 사용한 이유
+
+일반 Java NIO로도 non-blocking TCP 서버를 만들 수 있지만, partial read/write, buffer 관리, selector loop, backpressure를 직접 구현해야 합니다.
+
+Netty는 event loop와 pipeline, encoder/decoder, `AUTO_READ`, write buffer watermark 같은 기능을 제공하므로 커스텀 TCP 프로토콜을 더 단순하고 안정적으로 구현할 수 있습니다.  
+이 프로젝트처럼 많은 연결에서 바이너리 프레임을 파싱하고 ACK를 직접 인코딩해야 하는 구조에 적합합니다.
+
 이 프로젝트는 아래 목적을 기준으로 구성되어 있습니다.
 
 - 커스텀 바이너리 TCP 프로토콜 처리
