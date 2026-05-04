@@ -76,6 +76,23 @@ Spring Boot + Netty 기반의 로봇 TCP 통신 서버입니다.
 6. `PersistenceWorker`가 주기적으로 queue를 drain 해서 JDBC batch insert 수행
 7. 비즈니스 결과를 `RobotAckEncoder`가 응답 프레임으로 인코딩
 
+### Spring Batch 대신 JDBC batch를 사용한 이유
+
+이 서버의 저장 흐름은 정해진 입력 데이터를 한 번에 처리하는 배치 작업이 아니라, TCP로 계속 들어오는 작은 로봇 메시지를 메모리 큐에 모았다가 짧은 주기로 DB에 저장하는 실시간 ingest 구조입니다.
+
+Spring Batch는 `Job`, `Step`, `ItemReader`, `ItemProcessor`, `ItemWriter`, `JobRepository`를 중심으로 대량 데이터 처리, 실행 이력 관리, 실패 지점 재시작, skip/retry 정책이 필요한 ETL/정산/마이그레이션성 작업에 적합합니다.
+
+이 프로젝트에서는 그런 job 실행 모델보다 아래 특성이 더 중요합니다.
+
+- 메시지 수신 후 DB 저장 완료를 기다리지 않고 빠르게 ACK 응답
+- 작은 insert를 일정 개수만큼 묶어서 DB round trip 감소
+- `PersistenceQueue` depth를 기준으로 backpressure를 직접 제어
+- `batch-size`, `flush-interval-ms`, `high-watermark`, `low-watermark`를 단순하게 튜닝
+- Netty event loop와 DB 저장 작업을 명확히 분리
+
+따라서 현재 구조는 Spring Batch 프레임워크를 올리기보다 `PersistenceQueue` + `PersistenceWorker` + JDBC batch insert 조합을 사용합니다.  
+즉, 여기서 필요한 것은 "배치 작업 관리"가 아니라 "실시간으로 유입되는 메시지의 DB insert를 묶어서 보내는 최적화"입니다.
+
 ## 4. TCP 프로토콜
 
 ### 프레임 구조
