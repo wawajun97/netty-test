@@ -5,6 +5,10 @@ import io.netty.buffer.ByteBuf;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 
+/*
+* 로봇에서 들어온 데이터를 파싱
+* 파싱 후 AbstractPositon(Status)OperationHandler에서 DB작업을 위한 큐에 저장
+*/
 public final class RobotPayloadReader {
     private RobotPayloadReader() {
     }

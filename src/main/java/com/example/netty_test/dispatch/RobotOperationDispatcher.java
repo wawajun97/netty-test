@@ -6,6 +6,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/*
+* 서버 시작 시 모든 robotType과 opCode를 기준으로 헨들러 등록
+* enum 타입으로 robotType, opCode 관리도 가능
+*/
 @Component
 public class RobotOperationDispatcher {
     private final Map<RoutingKey, RobotOperationHandler> handlers;

@@ -34,6 +34,7 @@ public class NettyChannelInitializer extends ChannelInitializer<SocketChannel> {
         // STX/ETX 기반 커스텀 바이너리 프로토콜을 RobotFrame으로 변환한다.
         pipeline.addLast(new RobotFrameDecoder(robotProtocolProperties, robotMetrics));
         // 비즈니스 처리 결과인 RobotAck를 TCP 응답 바이트로 인코딩한다.
+        // outbound 이벤트는 pipeline을 뒤에서 앞으로 통과하므로 RobotMessageRouterHandler가 생성한 ACK를 인코딩하려면 RobotAckEncoder가 그 앞에 있어야 한다.
         pipeline.addLast(robotAckEncoder);
         // robotType/opCode 조합으로 실제 비즈니스 핸들러를 찾아 실행한다.
         pipeline.addLast(robotMessageRouterHandler);
