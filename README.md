@@ -45,7 +45,11 @@ TCP 연결 수립
 ```
 
 ---
+## 아키텍처
 
+![Architecture](docs/architecture.png)
+
+---
 ## TCP 프로토콜
 
 ### 프레임 구조
